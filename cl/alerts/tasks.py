@@ -1,6 +1,8 @@
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union, cast
 
+import requests
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import EmailMultiAlternatives, get_connection
@@ -9,7 +11,9 @@ from django.template import loader
 from django.utils.timezone import now
 
 from cl.alerts.models import DocketAlert
+from cl.api.models import Webhook, WebhookEvent
 from cl.celery_init import app
+from cl.corpus_importer.api_serializers import DocketEntrySerializer
 from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.lib.redis_utils import create_redis_semaphore, delete_redis_semaphore
 from cl.lib.string_utils import trunc
@@ -69,6 +73,22 @@ def make_alert_messages(
     return messages
 
 
+def make_docket_alert_webhook_payload(
+    docket_entries: List[DocketEntry], webhook: Webhook
+) -> Dict:
+    serialized_docket_entries = []
+    for de in docket_entries:
+        serialized_docket_entries.append(DocketEntrySerializer(de).data)
+    return {
+        "webhook": {
+            "event_type": webhook.event_type,
+            "version": webhook.version,
+            "date_created": webhook.date_created,
+        },
+        "results": serialized_docket_entries,
+    }
+
+
 # Ignore the result or else we'll use a lot of memory.
 @app.task(ignore_result=True)
 def send_docket_alert(d_pk: int, since: datetime) -> None:
@@ -78,11 +98,8 @@ def send_docket_alert(d_pk: int, since: datetime) -> None:
     :param since: If we run alerts, notify users about items *since* this time.
     :return: None
     """
-    email_addresses = (
-        User.objects.filter(docket_alerts__docket_id=d_pk)
-        .distinct()
-        .values_list("email", flat=True)
-    )
+    users = User.objects.filter(docket_alerts__docket_id=d_pk).distinct()
+    email_addresses = users.values_list("email", flat=True)
     if not email_addresses:
         # Nobody subscribed to the docket.
         delete_redis_semaphore("ALERTS", make_alert_key(d_pk))
@@ -99,6 +116,26 @@ def send_docket_alert(d_pk: int, since: datetime) -> None:
     messages = make_alert_messages(d, new_des, email_addresses)
     connection = get_connection()
     connection.send_messages(messages)
+
+    # Notify all the webhooks available for the users subscribed
+    for user in users:
+        for webhook in user.webhooks:
+            if webhook.enabled:
+                post_content = make_docket_alert_webhook_payload(
+                    new_des, webhook
+                )
+                response = requests.post(
+                    webhook.url, data=post_content, timeout=30
+                )
+                WebhookEvent.objects.create(
+                    webhook=webhook,
+                    status_code=response.status_code,
+                    content=post_content,
+                    response=response.text,
+                )
+                if not response.ok:
+                    webhook.failure_count = webhook.failure_count + 1
+                    webhook.save()
 
     # Work completed. Tally, log, and clean up
     tally_stat("alerts.docket.alerts.sent", inc=len(email_addresses))

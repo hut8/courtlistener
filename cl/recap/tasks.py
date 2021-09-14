@@ -1,5 +1,3 @@
-import base64
-import json
 import logging
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Tuple, Union
@@ -8,6 +6,7 @@ from zipfile import ZipFile
 import requests
 from celery import Task
 from celery.canvas import chain
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -41,7 +40,10 @@ from cl.custom_filters.templatetags.text_filters import oxford_join
 from cl.lib.crypto import sha1
 from cl.lib.filesizes import convert_size_to_bytes
 from cl.lib.pacer import map_cl_to_pacer_id
-from cl.lib.pacer_session import get_pacer_cookie_from_cache
+from cl.lib.pacer_session import (
+    get_or_cache_pacer_cookies,
+    get_pacer_cookie_from_cache,
+)
 from cl.lib.recap_utils import get_document_filename
 from cl.lib.storage import RecapEmailSESStorage
 from cl.lib.string_diff import find_best_match
@@ -1431,10 +1433,10 @@ def mark_fq_status(fq, msg, status):
 
 @app.task(bind=True, max_retries=5, interval_start=5 * 60)
 def process_recap_email(
-    self: Task, pk: int
+    self: Task, epq_pk: int, user_pk: int
 ) -> Optional[Dict[str, Union[int, bool]]]:
     start_time = now()
-    epq = EmailProcessingQueue.objects.get(pk=pk)
+    epq = EmailProcessingQueue.objects.get(pk=epq_pk)
     mark_pq_status(epq, "", PROCESSING_STATUS.IN_PROGRESS, "status_message")
 
     message_id = epq.message_id
@@ -1480,6 +1482,16 @@ def process_recap_email(
         docket, data["docket_entries"]
     )
 
+    for rd in rds_created:
+        fq = PacerFetchQueue.objects.create(
+            user_id=user_pk, request_type=REQUEST_TYPE.PDF, recap_document=rd
+        )
+        # Ensures we have PACER cookies ready to go.
+        get_or_cache_pacer_cookies(
+            fq.user_id, settings.PACER_USERNAME, settings.PACER_PASSWORD
+        )
+        fetch_pacer_doc_by_rd(rd.pk, fq.pk)
+
     if content_updated:
         newly_enqueued = enqueue_docket_alert(docket.pk)
         if newly_enqueued:
@@ -1491,7 +1503,7 @@ def process_recap_email(
     }
 
 
-def do_recap_document_fetch(epq: EmailProcessingQueue) -> None:
+def do_recap_document_fetch(epq: EmailProcessingQueue, user: User) -> None:
     return chain(
-        process_recap_email.si(epq.pk),
+        process_recap_email.si(epq.pk, user.pk),
     ).apply_async()
